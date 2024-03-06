@@ -16,6 +16,8 @@
 #include <chrono>
 #include <iostream>
 
+#include <cmath>
+
 // Define any required enums or structs to represent flight states or other constants
 enum class FlightState {
 
@@ -42,6 +44,7 @@ public:
 		distance_sensor_subscriber_ = this->create_subscription<px4_msgs::msg::DistanceSensor>("/fmu/out/distance_sensor", qos, 
 					 std::bind(&DroneControl::distance_sensor_callback, this, std::placeholders::_1));
 
+		// Offboard Control
         offboard_setpoint_counter_ = 0;
 
 		auto timer_callback = [this]() -> void {
@@ -54,15 +57,19 @@ public:
 				this->arm();
 			}
 
+			if (last_requested_waypoint_index_ == -1)
+				last_requested_waypoint_index_ = 0;
+
 			// offboard_control_mode needs to be paired with trajectory_setpoint
 			publish_offboard_control_mode();
-			publish_trajectory_setpoint(square_waypoints_[0]);
+			publish_trajectory_setpoint(square_waypoints_[last_requested_waypoint_index_]);
 
 			// stop the counter after reaching 11
 			if (offboard_setpoint_counter_ < 11) {
 				offboard_setpoint_counter_++;
 			}
 		};
+
 		timer_ = this->create_wall_timer(std::chrono::milliseconds(100), timer_callback);
     }
 
@@ -70,64 +77,40 @@ public:
 	void disarm();
 
 private:
+
+	// Data members
     std::vector<std::array<float, 3>> square_waypoints_;
-    rclcpp::TimerBase::SharedPtr timer_;
+
+	int last_requested_waypoint_index_ = -1; // index value (-1 means no waypoints requested)
+	float POSITION_ERROR_TOLERANCE = 1.5; // m
+
+	px4_msgs::msg::VehicleOdometry latest_odometry_;
+	px4_msgs::msg::DistanceSensor latest_distance_data_;
+
+	rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_subscriber_;
+	rclcpp::Subscription<px4_msgs::msg::DistanceSensor>::SharedPtr distance_sensor_subscriber_;
 
 	rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
 	rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_publisher_;
 
-	rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_subscriber_;
-	rclcpp::Subscription<px4_msgs::msg::DistanceSensor>::SharedPtr distance_sensor_subscriber_;
-	
-	int last_completed_waypoint_ = -1;
-	float POSITION_ERROR_TOLERANCE = 1.5; //m
-
-	px4_msgs::msg::VehicleOdometry latest_odometry_;
-	px4_msgs::msg::DistanceSensor latest_distance_data_;
-
+	rclcpp::TimerBase::SharedPtr timer_;
 	std::atomic<uint64_t> timestamp_;   //!< common synced timestamped
 	uint64_t offboard_setpoint_counter_;   //!< counter for the number of setpoints sent
 
-    void initializeWaypoints();
-	void publish_offboard_control_mode();
-	void publish_trajectory_setpoint(std::array<float, 3> waypoint);
-	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
-
+	// Helper methods
+	void initializeWaypoints();
+	bool hasWaypointReached();
+    
+	// Subscriber callbacks
 	void odometry_callback(const px4_msgs::msg::VehicleOdometry::UniquePtr msg);
 	void distance_sensor_callback(const px4_msgs::msg::DistanceSensor::UniquePtr msg);
 
-	bool hasWaypointReached(int last_requested_waypoint_index_);
-	bool isNearObstacle();
+	// Publisher callbacks
+	void publish_offboard_control_mode();
+	void publish_trajectory_setpoint(std::array<float, 3> waypoint);
+	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);	
 };
-
-void DroneControl::odometry_callback(const px4_msgs::msg::VehicleOdometry::UniquePtr msg)
-{
-	latest_odometry_ = *msg;
-
-	std::cout << "Current xyz: " << msg->position[0] << " " << msg->position[1] << " " << msg->position[2] << " " << std::endl;
-}
-
-void DroneControl::distance_sensor_callback(const px4_msgs::msg::DistanceSensor::UniquePtr msg)
-{
-	latest_distance_data_ = *msg;
-
-	std::cout << "Current distance: " << msg->current_distance << std::endl;
-}
-
-bool DroneControl::hasWaypointReached(int last_requested_waypoint_index_)
-{
-	bool result = false;
-
-	return result;
-}
-
-bool DroneControl::isNearObstacle()
-{
-	bool result = false;
-
-	return result;
-}
 
 void DroneControl::initializeWaypoints()
 {
@@ -138,6 +121,46 @@ void DroneControl::initializeWaypoints()
         {50.0, 50.0, -15.0}, // Second waypoint
         {0.0, 50.0, -15.0} // Third waypoint
     };
+}
+
+bool DroneControl::hasWaypointReached()
+{
+	bool result = false;
+
+	if (last_requested_waypoint_index_ != -1)
+	{
+		float dx = square_waypoints_[last_requested_waypoint_index_][0] - latest_odometry_.position[0];
+		float dy = square_waypoints_[last_requested_waypoint_index_][1] - latest_odometry_.position[1];
+		float dz = square_waypoints_[last_requested_waypoint_index_][2] - latest_odometry_.position[2];
+
+		float error = sqrt(dx*dx + dy*dy + dz*dz);
+		
+		result = error <= POSITION_ERROR_TOLERANCE;
+
+		if (result == true)
+		{
+			std::cout << "------------ Waypoint " << last_requested_waypoint_index_ << " reached with " << error << " error -----------\n"; 
+			last_requested_waypoint_index_++;
+		}
+	}
+
+	return result;
+}
+
+void DroneControl::odometry_callback(const px4_msgs::msg::VehicleOdometry::UniquePtr msg)
+{
+	latest_odometry_ = *msg;
+
+	std::cout << "Current xyz: " << msg->position[0] << " " << msg->position[1] << " " << msg->position[2] << " " << std::endl;
+
+	hasWaypointReached();
+}
+
+void DroneControl::distance_sensor_callback(const px4_msgs::msg::DistanceSensor::UniquePtr msg)
+{
+	latest_distance_data_ = *msg;
+
+	std::cout << "Current distance: " << msg->current_distance << std::endl;
 }
 
 void DroneControl::arm()
@@ -175,6 +198,8 @@ void DroneControl::publish_offboard_control_mode()
  */
 void DroneControl::publish_trajectory_setpoint(std::array<float, 3> waypoint)
 {
+
+	std::cout << "Target xyz: " << waypoint[0] << " " << waypoint[1] << " " << waypoint[2] << std::endl;
 	px4_msgs::msg::TrajectorySetpoint msg{};
 	msg.position = waypoint;
 	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
