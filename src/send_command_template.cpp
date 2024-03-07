@@ -21,7 +21,8 @@
 // Define any required enums or structs to represent flight states or other constants
 enum class FlightState {
 	NAVIGATE,
-	AVOID_OBSTACLE
+	AVOID_OBSTACLE,
+	TRANSITION_TO_NAVIGATE
 };
 
 class DroneControl : public rclcpp::Node {
@@ -34,6 +35,7 @@ public:
         offboard_control_mode_publisher_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
 		trajectory_setpoint_publisher_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
 		vehicle_command_publisher_ = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
+		// attitude_setpoint_publisher = this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>("fmu/in/vehi")
 
 		// Initialize subscribers with appropriate topics and QoS settings
 		rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
@@ -81,10 +83,13 @@ private:
     std::vector<std::array<float, 3>> square_waypoints_;
 
 	int last_requested_waypoint_index_ = -1; // index value (-1 means no waypoints requested)
-	float POSITION_ERROR_TOLERANCE = 1.5; // m
+	float POSITION_ERROR_TOLERANCE = 1.0; // m
 	float DISTANCE_ERROR_THRESHOLD = 5.0; // m
 	float DISTANCE_SIGNAL_QUALITY_THRESHOLD = 50; // approximate distance sensor quality value at DISTANCE_ERROR_THRESHOLD -> empirically calculated
-	bool STOPPED = false; // flag to check if drone stops at first encountering obstacle
+	float STOP_VELOCITY_THRESHOLD = 0.1; // m/s
+	float CLEAR_DISTANCE = 1.0; // m -> Distance to clear in forward direction before switching from AVOID_OBSTACLE to NAVIGATE mode. Should be atleast the length of the drone
+	bool DRONE_WAS_STOPPED = false; // flag to check if drone was stopped after encountering obstacle
+	bool set_zero_velocity_ = false; // flag to set zero velocity for trajectory
 	std::array<float, 3> next_waypoint_;
 
 	FlightState state = FlightState::NAVIGATE;
@@ -136,17 +141,32 @@ bool DroneControl::hasWaypointReached()
 {
 	bool result = false;
 
-	if (last_requested_waypoint_index_ != -1)
-	{
-		float dx = square_waypoints_[last_requested_waypoint_index_][0] - latest_odometry_.position[0];
-		float dy = square_waypoints_[last_requested_waypoint_index_][1] - latest_odometry_.position[1];
-		float dz = square_waypoints_[last_requested_waypoint_index_][2] - latest_odometry_.position[2];
+	// check if drone reached last waypoint
 
-		float error = sqrt(dx*dx + dy*dy + dz*dz);
+	float dx = next_waypoint_[0] - latest_odometry_.position[0];
+	float dy = next_waypoint_[1] - latest_odometry_.position[1];
+	float dz = next_waypoint_[2] - latest_odometry_.position[2];
+
+	float error = sqrt(dx*dx + dy*dy + dz*dz);
+	
+	result = error <= POSITION_ERROR_TOLERANCE;
+
+	std::cout << "Target waypoint reached? " << error << std::endl;
+
+	// If drone reached last waypoint, and drone is in NAVIGATE mode, go to next square waypoint
+	if (result == true && state == FlightState::NAVIGATE)
+	{
+		// Check if drone reached last requested square waypoint
+		dx = square_waypoints_[last_requested_waypoint_index_][0] - latest_odometry_.position[0];
+		dy = square_waypoints_[last_requested_waypoint_index_][1] - latest_odometry_.position[1];
+		dz = square_waypoints_[last_requested_waypoint_index_][2] - latest_odometry_.position[2];
+
+		error = sqrt(dx*dx + dy*dy + dz*dz);
 		
 		result = error <= POSITION_ERROR_TOLERANCE;
 
-		if (result == true)
+		// select next square waypoint if drone reached last square waypoint
+		if (result == true && last_requested_waypoint_index_ != -1)
 		{
 			std::cout << "------------ Waypoint " << last_requested_waypoint_index_ << " reached with " << error << " error -----------\n"; 
 
@@ -171,12 +191,35 @@ bool DroneControl::isNearObstacle()
 	{
 		result = true;
 		state = FlightState::AVOID_OBSTACLE;
+		set_zero_velocity_ = DRONE_WAS_STOPPED ? false : true; // If drone was stopped after encountering obstacle, don't set velocity to zero. Otherwise, set it to zero.
 		std::cout << "------------ Obstacle Avoidance Mode ------------\n";
+
 	}
 	else
 	{
-		state = FlightState::NAVIGATE;
-		std::cout << "------------ Navigation Mode ------------\n";
+		// IF drone is transitioning from AVOID_OBSTACLE -> NAVIGATE, 
+		// fly forward for value set by CLEAR_DISTANCE to avoid getting
+		// stuck behind obstacle in case drone pitches down before moving forward.	
+		if (state == FlightState::AVOID_OBSTACLE)
+		{
+			state = FlightState::TRANSITION_TO_NAVIGATE;
+			std::cout << "------------ Transition Mode ------------\n";
+			
+		}
+		else if (state == FlightState::TRANSITION_TO_NAVIGATE)
+		{
+			if (hasWaypointReached()) // has drone cleared last seen obstacle
+			{
+				state = FlightState::NAVIGATE; // set state to navigate
+			}
+		}
+		else 
+		{
+			state = FlightState::NAVIGATE;
+			set_zero_velocity_ = false;
+			DRONE_WAS_STOPPED = false;
+			std::cout << "------------ Navigation Mode ------------\n";
+		}
 	}
 
 	return result;
@@ -184,17 +227,41 @@ bool DroneControl::isNearObstacle()
 
 void DroneControl::calculateNextWaypoint()
 {
-	if (last_requested_waypoint_index_ == -1)
-		last_requested_waypoint_index_ = 0;
-
 	if (state == FlightState::NAVIGATE)
+	{
+		if (last_requested_waypoint_index_ == -1) // no waypoints have been requested since this node was running
+			last_requested_waypoint_index_ = 0;
+
 		next_waypoint_ = square_waypoints_[last_requested_waypoint_index_];
-	
+		std::cout << "Updated waypoint to " << last_requested_waypoint_index_ << std::endl;
+	}
 	else if (state == FlightState::AVOID_OBSTACLE)
 	{
-		std::array<float, 3> next_waypoint = latest_odometry_.position;
-		next_waypoint_[2] = next_waypoint[2] - float(10.0); // fly 1m up to avoid current obstacle
+		next_waypoint_ = latest_odometry_.position;
+
+		if(set_zero_velocity_ == true)
+		{
+			// zero velocity will automatically be published in publish_trajectory_setpoint method
+
+			// check if NORTH velocity has become zero
+			if (latest_odometry_.velocity[0] <= STOP_VELOCITY_THRESHOLD)
+				DRONE_WAS_STOPPED = true;
+		}
+		else // this clause assumes drone was stopped -> now fly up to avoid obstacle
+		{
+			next_waypoint_[2] = next_waypoint_[2] - 2.0; // fly up to avoid current obstacle
+		}
 	}
+	else if (state == FlightState::TRANSITION_TO_NAVIGATE)
+	{
+		if (hasWaypointReached())
+		{
+			next_waypoint_ = latest_odometry_.position;
+			next_waypoint_[0] = next_waypoint_[0] + latest_distance_data_.current_distance + CLEAR_DISTANCE; // Move forward by "CLEAR_DISTANCE" to clear the obstacle
+			next_waypoint_[2] = next_waypoint_[2] - 2.0; // move 1m up
+		}
+	}
+	
 }
 
 void DroneControl::odometry_callback(const px4_msgs::msg::VehicleOdometry::UniquePtr msg)
@@ -237,7 +304,8 @@ void DroneControl::publish_offboard_control_mode()
 {
 	px4_msgs::msg::OffboardControlMode msg{};
 	msg.position = true;
-	msg.velocity = false;
+	// set_zero_velocity_ ? msg.velocity = true : msg.velocity = false; // control velocity if required
+	msg.velocity = true;
 	msg.acceleration = false;
 	msg.attitude = false;
 	msg.body_rate = false;
@@ -256,6 +324,13 @@ void DroneControl::publish_trajectory_setpoint(std::array<float, 3> waypoint)
 	std::cout << "Target xyz: " << waypoint[0] << " " << waypoint[1] << " " << waypoint[2] << std::endl;
 	px4_msgs::msg::TrajectorySetpoint msg{};
 	msg.position = waypoint;
+	if (set_zero_velocity_)
+	{
+		msg.velocity = {0, 0, 0};
+		std::cout << "Target vel: " << msg.velocity[0] << " " << msg.velocity[1] << " " << msg.velocity[2] << std::endl;
+	}
+	// msg.velocity = {0, 0, 0};
+	// std::cout << "Target vel: " << msg.velocity[0] << " " << msg.velocity[1] << " " << msg.velocity[2] << std::endl;
 	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 	trajectory_setpoint_publisher_->publish(msg);
 }
