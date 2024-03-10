@@ -20,7 +20,7 @@ using waypointNED = std::array<float, 3>;
  * NAVIGATE:
  * 			 Drone moves to next square waypoint. This is the default state
  * 			 and the drone starts in this state. Drone exits this state when
- * 			 an obstacle is seen. Drone enters this state again from "TRANSITION_TO_NAVIGATE"
+ * 			 an obstacle is seen. Drone enters this state again from "CLEAR_OBSTACLE"
  * 			 after an obstacle has been cleared.
  * 
  * AVOID_OBSTACLE: 
@@ -29,7 +29,7 @@ using waypointNED = std::array<float, 3>;
  * 			 distance and quality of signal data from distance sensor cross the
  * 		     values set by DISTANCE_ERROR_THRESHOLD and DISTANCE_SIGNAL_QUALITY_THRESHOLD.
  * 
- * TRANSITION_TO_NAVIGATE: 
+ * CLEAR_OBSTACLE: 
  * 
  * 			 After the drone stops detection obstacles in "AVOID_OBSTACLE" state, it
  * 			 enters this state. The drone now tries to "clear" the obstacle by moving
@@ -39,7 +39,8 @@ using waypointNED = std::array<float, 3>;
 enum class FlightState {
 	NAVIGATE,
 	AVOID_OBSTACLE,
-	TRANSITION_TO_NAVIGATE
+	CLEAR_OBSTACLE,
+	RETURN_TO_PATH
 };
 
 /**
@@ -69,22 +70,25 @@ private:
     std::vector<waypointNED> square_waypoints_;
 	waypointNED next_waypoint_; // drone is always following this waypoint. It can be set by any state.
 	int last_requested_waypoint_index_ = -1; // for square waypoints only (zero based indexing, -1 means no waypoints requested since beginning of node)
-	int lap_ = 0;
-	
+	int lap_ = 1;
+	float last_positive_obstacle_distance_ = 0.0; // keeps track of non-zero distance from last scene obstacle in AVOID_OBSTACLE mode
+	bool request_clear_obstacle_ = false; // flag for checking if waypoint for clearing obstacle has been set
+
+	std::vector<std::string> state_name_ = {"NAVIGATE", "AVOID OBSTACLE", "CLEAR OBSTACLE", "RETURN TO PATH"};
 
 	// Flags and constants
 	float POSITION_ERROR_TOLERANCE = 1.0; // m
 	float DISTANCE_ERROR_THRESHOLD = 5.0; // m
 	float DISTANCE_SIGNAL_QUALITY_THRESHOLD = 1; // decrease this threshold with increase in MPC_XY_VEL_MAX param
 	float STOP_VELOCITY_THRESHOLD = 0.1; // In m/s. If odometry reported velocity is less than this value, drone was stopped.
-	float CLEAR_DISTANCE = 1.0; // In m -> Distance to clear in forward direction before switching from AVOID_OBSTACLE to NAVIGATE mode.
+	float CLEAR_DISTANCE = 2.0; // In m -> Distance to clear in forward direction before switching from AVOID_OBSTACLE to NAVIGATE mode.
 								// Should be atleast the length of the drone
 	bool DRONE_WAS_STOPPED = false; // flag to check if drone was stopped after encountering obstacle
 	int TOTAL_LAPS = 3;
 	bool set_zero_velocity_ = false; // flag to set zero velocity for trajectory
 	bool DISARM = false;
 
-	FlightState state = FlightState::NAVIGATE; // Start node in navigatio mode
+	FlightState state_ = FlightState::NAVIGATE; // Start node in navigatio mode
 
 	px4_msgs::msg::VehicleOdometry latest_odometry_;
 	px4_msgs::msg::DistanceSensor latest_distance_data_;
