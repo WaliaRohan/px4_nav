@@ -100,30 +100,27 @@ bool DroneControl::hasWaypointReached()
 
 			if (last_requested_waypoint_index_ < static_cast<int>(square_waypoints_.size() - 1))
 				last_requested_waypoint_index_++; // move to next waypoint
-			else
+			else // drone has reached end of a lap
 			{
 				if (lap_ < TOTAL_LAPS)
 				{
-					last_requested_waypoint_index_ = 0; // restart lap
 					lap_++;
+					last_requested_waypoint_index_ = 0; // restart lap
 					std::cout << state_name_[static_cast<int>(state_)] << " :: ------------ Starting lap " << lap_ << " ------------\n";
 				}
 				else
 				{
-					if (last_requested_waypoint_index_ != 0) // If laps are complete, send drone back to home
-					{
-						last_requested_waypoint_index_ = 0;
-						calculateNextWaypoint();
-					}
-					else if (result = true)
-					{
-						DISARM = true;
-					}
-					
+					state_ = FlightState::RETURN_TO_BASE;
 				}
 					
 			}
 		}
+	}
+	if (state_ == FlightState::RETURN_TO_BASE && next_waypoint_ == square_waypoints_[0] && result == true)
+	{
+		std::cout << state_name_[static_cast<int>(state_)] 
+				  << " :: Target xyz: " << next_waypoint_[0] << " " << next_waypoint_[1] << " " << next_waypoint_[2] << std::endl;
+		DISARM = true;
 	}
 
 	return result;
@@ -143,21 +140,16 @@ bool DroneControl::isNearObstacle()
 
 		if(latest_distance_data_.current_distance > 0)
 			last_positive_obstacle_distance_ = latest_distance_data_.current_distance;
-		std::cout << "------------ Obstacle Avoidance Mode ------------\n";
 
 	}
 	else
 	{
-		// IF drone is transitioning from AVOID_OBSTACLE -> NAVIGATE, 
-		// fly forward for value set by CLEAR_DISTANCE to avoid getting
-		// stuck behind obstacle in case drone pitches down before moving forward.	
 		if (state_ == FlightState::AVOID_OBSTACLE)
 		{
 			if (hasWaypointReached())
 			{
 				state_ = FlightState::CLEAR_OBSTACLE;
 			}
-			// std::cout << "------------ Clear Obstacle Mode ------------\n";
 		}
 		else if (state_ == FlightState::CLEAR_OBSTACLE)
 		{
@@ -165,24 +157,22 @@ bool DroneControl::isNearObstacle()
 			{
 				state_ = FlightState::RETURN_TO_PATH;
 				request_clear_obstacle_ = false;
-				// std::cout << "------------ Return To Path Mode ------------\n";
 			}	
 		}
 		else if (state_ == FlightState::RETURN_TO_PATH)
 		{
 			last_positive_obstacle_distance_ = 0; // since drone has cleared obstacle, set this tracker to 0 for next AVOID_OBSTACLE cycle
+			bool is_mission_complete = lap_ == TOTAL_LAPS && last_requested_waypoint_index_ == static_cast<int>(square_waypoints_.size() - 1);
 			if (hasWaypointReached()) // has drone returned to path
 			{
-				state_ = FlightState::NAVIGATE; // set state to navigate
-				// std::cout << "------------ Navigation Mode ------------\n";
+				state_ = is_mission_complete ? FlightState::RETURN_TO_BASE : FlightState::NAVIGATE; // set state to navigate if mission is not complete
 			}
 		}
-		else 
+		else if (state_ != FlightState::RETURN_TO_BASE)
 		{
 			state_ = FlightState::NAVIGATE;
 			set_zero_velocity_ = false;
 			DRONE_WAS_STOPPED = false;
-			// std::cout << "------------ Navigation Mode ------------\n";
 		}
 
 	}
@@ -212,11 +202,10 @@ void DroneControl::calculateNextWaypoint()
 			if (latest_odometry_.velocity[0] <= STOP_VELOCITY_THRESHOLD)
 				DRONE_WAS_STOPPED = true;
 		}
-		else // this clause assumes drone was stopped -> now fly up to avoid obstacle
+		else // this clause assumes drone was stopped -> now fly right to avoid obstacle
 		{
 			if (isNearObstacle())
 				next_waypoint_[1] = next_waypoint_[1] + CLEAR_DISTANCE; // fly right to avoid current obstacle
-			// next_waypoint_[2] = next_waypoint_[2] - CLEAR_DISTANCE; // fly up to avoid current obstacle
 		}
 	}
 	else if (state_ == FlightState::CLEAR_OBSTACLE)
@@ -227,7 +216,6 @@ void DroneControl::calculateNextWaypoint()
 			next_waypoint_[0] += last_positive_obstacle_distance_ + CLEAR_DISTANCE; // Move forward by "CLEAR_DISTANCE" to clear the obstacle
 			std::cout << state_name_[static_cast<int>(state_)] << " :: Moving forward by " << last_positive_obstacle_distance_ + CLEAR_DISTANCE << std::endl;
 			request_clear_obstacle_ = true;
-			// next_waypoint_[1] = next_waypoint_[2] + CLEAR_DISTANCE; // move up
 		}
 	}
 	else if (state_ == FlightState::RETURN_TO_PATH)
@@ -251,6 +239,10 @@ void DroneControl::calculateNextWaypoint()
 					  << closest_waypoint_on_path[2] << std::endl; 
 			next_waypoint_ = closest_waypoint_on_path;
 		}
+	}
+	else if (state_ == FlightState::RETURN_TO_BASE)
+	{
+		next_waypoint_ = square_waypoints_[0];
 	}
 }
 
